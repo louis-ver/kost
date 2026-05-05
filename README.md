@@ -1,135 +1,168 @@
 # kost
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that autoscales queue-based batch workloads with cost awareness.
 
-## Getting Started
+[KEDA](https://keda.sh) scales on queue depth. The Kubernetes HPA scales on CPU. Neither one knows what your workers cost per hour. `kost` does.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## How it works
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+`kost` watches an SQS queue and an EC2 spot price feed. Every 30 seconds it computes:
 
-```sh
-make docker-build docker-push IMG=<some-registry>/kost:tag
+```
+desiredReplicas = ceil(queueDepth / targetMessagesPerWorker)
+estimatedCost   = desiredReplicas × spotPrice
+
+if estimatedCost > hourlyBudget && desiredReplicas > currentReplicas:
+    freeze scale-up   # BudgetHalted condition = True
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Scale-down uses a configurable stabilization window (default 120s) to prevent thrashing on bursty queues.
 
-**Install the CRDs into the cluster:**
+The spot price and queue depth are polled in background goroutines (SQS every 15s, EC2 pricing every 5m) and cached in memory. The reconciler reads from the cache — it never blocks on an AWS API call in the hot path.
 
-```sh
-make install
+## Architecture
+
+```
+┌─────────────────────────────────────────┐
+│ kost-controller Pod                     │
+│                                         │
+│  SQS Poller (15s) ──┐                  │
+│                      ├─▶ MetricsCache  │
+│  EC2 Poller  (5m)  ──┘        │        │
+│                                │        │
+│            Reconciler ◀────────┘        │
+│            reads cache                  │
+│            patches Deployment           │
+│            updates status               │
+└─────────────────────────────────────────┘
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+## Quick start
 
-```sh
-make deploy IMG=<some-registry>/kost:tag
+```bash
+# Install the CRD
+kubectl apply -f https://raw.githubusercontent.com/louis-ver/kost/main/config/crd/bases/kost.kost.io_costawarescalers.yaml
+
+# Deploy your workers as a normal Deployment, then create a scaler
+kubectl apply -f - <<EOF
+apiVersion: kost.kost.io/v1alpha1
+kind: CostAwareScaler
+metadata:
+  name: my-worker-scaler
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-worker
+
+  queue:
+    provider: sqs
+    url: https://sqs.us-east-1.amazonaws.com/123456789/my-queue
+    region: us-east-1
+    targetMessagesPerWorker: 10   # target queue depth per replica
+
+  scaling:
+    minReplicas: 1
+    maxReplicas: 50
+    scaleDownStabilizationSeconds: 120
+
+  cost:
+    instanceType: m5.xlarge
+    availabilityZone: us-east-1a
+    hourlyBudgetUSD: 10.00        # halt scale-up above this rate
+EOF
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Check status:
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+```bash
+$ kubectl get costawarescaler
+NAME               CURRENT   DESIRED   QUEUEDEPTH   COST/HR
+my-worker-scaler   8         12        124          1.07
 
-```sh
-kubectl apply -k config/samples/
+$ kubectl get costawarescaler my-worker-scaler -o jsonpath='{.status.conditions}'
+[{"type":"BudgetHalted","status":"False",...},{"type":"Degraded","status":"False",...}]
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## CRD reference
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+| Field | Description |
+|-------|-------------|
+| `spec.targetRef` | The Deployment to scale |
+| `spec.queue.url` | SQS queue URL |
+| `spec.queue.targetMessagesPerWorker` | Desired queue depth per replica |
+| `spec.scaling.minReplicas` / `maxReplicas` | Replica bounds |
+| `spec.scaling.scaleDownStabilizationSeconds` | Hold before committing a scale-down (default 120s) |
+| `spec.cost.instanceType` | Instance type for spot price lookup |
+| `spec.cost.availabilityZone` | AZ for spot price lookup |
+| `spec.cost.hourlyBudgetUSD` | Max $/hr rate — halts scale-up if exceeded |
 
-```sh
-kubectl delete -k config/samples/
+### Status conditions
+
+| Condition | Meaning |
+|-----------|---------|
+| `BudgetHalted=True` | Scale-up frozen — `desiredReplicas × spotPrice > hourlyBudgetUSD` |
+| `Degraded=True` | Queue depth cache is stale (>60s) — scaling decisions paused |
+| `Invalid=True` | Spec misconfiguration (e.g. `minReplicas > maxReplicas`) |
+
+## Metrics
+
+```
+kost_queue_depth{scaler, namespace}
+kost_desired_replicas{scaler, namespace}
+kost_current_replicas{scaler, namespace}
+kost_estimated_hourly_cost_usd{scaler, namespace}
+kost_spot_price_per_hour_usd{scaler, namespace}
+kost_budget_halted{scaler, namespace}           # gauge: 1 or 0
+kost_scaling_decisions_total{scaler, namespace, reason}
+kost_sqs_poll_errors_total{scaler}
+kost_pricing_poll_errors_total{scaler}
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## Design notes
 
-```sh
-make uninstall
+**Cost is a rate estimate, not accumulated spend.** `estimatedCost = desiredReplicas × spotPrice` is a $/hr rate check. It prevents scaling to a level you can't afford, not tracking total spend over time.
+
+**`instanceType` is a declaration, not a guarantee.** `kost` does not manage node provisioning — that is Karpenter or Cluster Autoscaler's job. The cost estimate is approximate.
+
+**Budget halt never forces a scale-down.** If spot price spikes while workers are running, in-flight jobs are not killed. Only new scale-up is blocked.
+
+**`kost` and HPA are mutually exclusive** for the same Deployment — they will conflict over `spec.replicas`.
+
+## IAM permissions required
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "sqs:GetQueueAttributes",
+    "ec2:DescribeSpotPriceHistory"
+  ],
+  "Resource": "*"
+}
 ```
 
-**UnDeploy the controller from the cluster:**
+## v0.1 scope
 
-```sh
-make undeploy
+- AWS only (SQS queue source, EC2 spot pricing)
+- Deployments only
+- Single `CostAwareScaler` per operator deployment
+
+## Roadmap
+
+- **v0.2 — Spot interruption handling**: detect EC2 spot interruption notices, requeue in-flight SQS messages before the instance is reclaimed
+- **v0.3 — GPU instance support**: extend cost lookup to GPU instance types for batch inference workloads
+- **Multi-queue / multi-CRD**: per-scaler poller lifecycle
+
+## Building
+
+```bash
+go build ./...
+go test ./...
+
+# Controller tests require envtest binaries
+make setup-envtest
+KUBEBUILDER_ASSETS=$(./bin/setup-envtest use 1.31.0 -p path) go test ./internal/controller/...
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/kost:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/kost/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Requires Go 1.22+, kubebuilder 4.x.
