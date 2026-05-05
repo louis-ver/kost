@@ -1,0 +1,9 @@
+apiVersion: kost.kost.io/v1alpha1
+kind: CostAwareScaler
+metadata:
+  labels:
+    app.kubernetes.io/name: kost
+    app.kubernetes.io/managed-by: kustomize
+  name: costawarescaler-sample
+spec:
+  # TODO(user): Add fields here
