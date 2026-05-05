@@ -34,10 +34,7 @@ func Compute(in Input) Result {
 		unclamped = in.MinReplicas
 	}
 
-	rawDesired := unclamped
-	if rawDesired > in.MaxReplicas {
-		rawDesired = in.MaxReplicas
-	}
+	rawDesired := min(unclamped, in.MaxReplicas)
 
 	estimatedCost := float64(rawDesired) * in.SpotPrice
 	budgetHalted := false

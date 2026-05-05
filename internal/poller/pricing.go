@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/louisolivier/kost/internal/cache"
 	kostmetrics "github.com/louisolivier/kost/internal/metrics"
 )
