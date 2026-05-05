@@ -16,9 +16,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	kostv1alpha1 "github.com/louisolivier/kost/api/v1alpha1"
 	"github.com/louisolivier/kost/internal/algorithm"
 	metricscache "github.com/louisolivier/kost/internal/cache"
+	kostmetrics "github.com/louisolivier/kost/internal/metrics"
 	"github.com/louisolivier/kost/internal/poller"
 )
 
@@ -163,6 +166,23 @@ func (r *CostAwareScalerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	scaler.Status.EstimatedHourlyCostUSD = result.EstimatedHourlyCost
 	if err := r.Status().Update(ctx, &scaler); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	labels := prometheus.Labels{"scaler": scaler.Name, "namespace": scaler.Namespace}
+	kostmetrics.QueueDepth.With(labels).Set(float64(queueDepth))
+	kostmetrics.DesiredReplicas.With(labels).Set(float64(result.DesiredReplicas))
+	kostmetrics.CurrentReplicas.With(labels).Set(float64(currentReplicas))
+	kostmetrics.EstimatedHourlyCostUSD.With(labels).Set(result.EstimatedHourlyCost)
+	kostmetrics.SpotPricePerHourUSD.With(labels).Set(spotPrice)
+	budgetHaltedVal := float64(0)
+	if result.BudgetHalted {
+		budgetHaltedVal = 1
+	}
+	kostmetrics.BudgetHalted.With(labels).Set(budgetHaltedVal)
+	if result.DesiredReplicas != currentReplicas {
+		kostmetrics.ScalingDecisions.With(prometheus.Labels{
+			"scaler": scaler.Name, "namespace": scaler.Namespace, "reason": result.Reason,
+		}).Inc()
 	}
 
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil

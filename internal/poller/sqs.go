@@ -8,7 +8,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/louisolivier/kost/internal/cache"
+	kostmetrics "github.com/louisolivier/kost/internal/metrics"
 )
 
 type SQSClient interface {
@@ -51,6 +53,7 @@ func (p *SQSPoller) poll(ctx context.Context) {
 	})
 	if err != nil {
 		p.logger.Error("sqs poll failed", "error", err)
+		kostmetrics.SQSPollErrors.With(prometheus.Labels{"scaler": "global"}).Inc()
 		return
 	}
 	queued, _ := strconv.ParseInt(out.Attributes["ApproximateNumberOfMessages"], 10, 64)

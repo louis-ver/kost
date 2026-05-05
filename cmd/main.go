@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -35,7 +36,12 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+
 	kostv1alpha1 "github.com/louisolivier/kost/api/v1alpha1"
+	"github.com/louisolivier/kost/internal/cache"
 	"github.com/louisolivier/kost/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -86,6 +92,13 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Load AWS config — fails fast if credentials or region are not configured
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	if err != nil {
+		setupLog.Error(err, "Failed to load AWS config — check AWS_REGION and credentials")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -178,9 +191,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	metricsCache := cache.New()
 	if err := (&controller.CostAwareScalerReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Cache:     metricsCache,
+		SQSClient: awssqs.NewFromConfig(awsCfg),
+		EC2Client: awsec2.NewFromConfig(awsCfg),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "costawarescaler")
 		os.Exit(1)
