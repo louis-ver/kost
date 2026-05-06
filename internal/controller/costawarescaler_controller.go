@@ -90,10 +90,17 @@ func (r *CostAwareScalerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	setCondition(&scaler.Status.Conditions, kostv1alpha1.ConditionDegraded, metav1.ConditionFalse, "MetricsFresh", "")
 
 	// Get spot price; fall back to on-demand if stale
-	spotPrice, priceAge, priceOK := r.Cache.SpotPrice()
-	if !priceOK || priceAge > 15*time.Minute {
-		spotPrice = onDemandPrice(scaler.Spec.Cost.InstanceType)
-		logger.Info("using on-demand price fallback", "instanceType", scaler.Spec.Cost.InstanceType, "price", spotPrice)
+	spotPrice, priceAge, priceInCache := r.Cache.SpotPrice()
+	if !priceInCache || priceAge > 15*time.Minute {
+		fallback, known := onDemandPrice(scaler.Spec.Cost.InstanceType)
+		spotPrice = fallback
+		if !known {
+			logger.Error(nil, "spot price unavailable and instance type unknown — using $1.00/hr fallback, cost estimates will be inaccurate",
+				"instanceType", scaler.Spec.Cost.InstanceType)
+		} else {
+			logger.Info("spot price cache stale, using on-demand price as fallback",
+				"instanceType", scaler.Spec.Cost.InstanceType, "price", spotPrice)
+		}
 	}
 
 	// Fetch target Deployment
@@ -222,26 +229,31 @@ func validateSpec(spec kostv1alpha1.CostAwareScalerSpec) error {
 }
 
 // onDemandPrice returns a conservative on-demand $/hr fallback for known instance types.
-func onDemandPrice(instanceType string) float64 {
+// The second return value is false when the type is unknown — callers should warn loudly
+// since the $1.00 fallback will make cost estimates meaningless for that type.
+func onDemandPrice(instanceType string) (price float64, known bool) {
 	prices := map[string]float64{
 		"m5.large": 0.096, "m5.xlarge": 0.192, "m5.2xlarge": 0.384, "m5.4xlarge": 0.768,
 		"c5.large": 0.085, "c5.xlarge": 0.170, "c5.2xlarge": 0.340, "c5.4xlarge": 0.680,
 		"r5.large": 0.126, "r5.xlarge": 0.252,
 	}
 	if p, ok := prices[instanceType]; ok {
-		return p
+		return p, true
 	}
-	return 1.0
+	return 1.0, false
 }
 
 func setCondition(conditions *[]metav1.Condition, condType string, status metav1.ConditionStatus, reason, message string) {
 	now := metav1.Now()
 	for i, c := range *conditions {
 		if c.Type == condType {
-			(*conditions)[i].Status = status
+			// Only update LastTransitionTime on actual status change
+			if c.Status != status {
+				(*conditions)[i].Status = status
+				(*conditions)[i].LastTransitionTime = now
+			}
 			(*conditions)[i].Reason = reason
 			(*conditions)[i].Message = message
-			(*conditions)[i].LastTransitionTime = now
 			return
 		}
 	}

@@ -131,6 +131,21 @@ var _ = Describe("CostAwareScaler controller", func() {
 		Expect(invalid).To(BeTrue())
 	})
 
+	It("uses on-demand price fallback when spot price cache is empty", func() {
+		createDeployment(1)
+		createScaler()
+		testCache.SetQueueDepth(20) // 20 / 10 = 2 replicas
+		// Deliberately no spot price set — reconciler should fall back to
+		// m5.xlarge on-demand ($0.192/hr), 2 * $0.192 = $0.384 << $10 budget
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: scalerKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		var dep appsv1.Deployment
+		Expect(k8sClient.Get(ctx, depKey, &dep)).To(Succeed())
+		Expect(*dep.Spec.Replicas).To(Equal(int32(2)))
+	})
+
 	It("requeues when queue cache is not yet populated", func() {
 		createDeployment(1)
 		createScaler()
