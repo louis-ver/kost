@@ -37,6 +37,9 @@ func NewIMDSPollerWithClient(client IMDSClient, interval time.Duration, logger *
 // Run polls IMDS until an interruption notice is detected or ctx is cancelled.
 // Returns true if an interruption notice was received.
 func (p *IMDSPoller) Run(ctx context.Context) bool {
+	if p.poll(ctx) {
+		return true
+	}
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for {
@@ -52,7 +55,10 @@ func (p *IMDSPoller) Run(ctx context.Context) bool {
 }
 
 func (p *IMDSPoller) poll(ctx context.Context) bool {
-	_, err := p.client.GetMetadata(ctx, &imds.GetMetadataInput{
+	pollCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	_, err := p.client.GetMetadata(pollCtx, &imds.GetMetadataInput{
 		Path: "spot/termination-time",
 	})
 	if err == nil {
