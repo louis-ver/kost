@@ -6,7 +6,7 @@
 
 **Architecture:** A new standalone binary (`cmd/node-agent`) polls the EC2 Instance Metadata Service every 5 seconds. On a 200 response it runs the `InterruptionHandler` once: cordon the node, list `CostAwareScaler` objects to find kost-managed worker pods on this node, evict each via the Kubernetes Eviction API, then exit. The existing operator is not modified.
 
-**Tech Stack:** Go 1.22+, controller-runtime client, `net/http` for IMDS, `k8s.io/api/policy/v1` for Eviction, `httptest` for IMDS unit tests, controller-runtime `fake` client for handler tests.
+**Tech Stack:** Go 1.22+, controller-runtime client, `github.com/aws/aws-sdk-go-v2/feature/ec2/imds` for IMDS (IMDSv1 + IMDSv2), `k8s.io/api/policy/v1` for Eviction, `fakeIMDSClient` interface for IMDS unit tests, controller-runtime `fake` client for handler tests.
 
 ---
 
@@ -14,9 +14,9 @@
 
 | File | Responsibility |
 |------|----------------|
-| `internal/nodeagent/imds.go` | IMDSPoller — polls URL, returns bool (interrupted) |
-| `internal/nodeagent/imds_test.go` | Unit tests with `httptest.Server` |
-| `internal/nodeagent/handler.go` | InterruptionHandler + pure `selectPodsForEviction` |
+| `internal/nodeagent/imds.go` | IMDSPoller — AWS SDK IMDS client, polls every 5s, returns bool (interrupted) |
+| `internal/nodeagent/imds_test.go` | Unit tests with injectable `fakeIMDSClient` (no HTTP server needed) |
+| `internal/nodeagent/handler.go` | InterruptionHandler + pure `SelectPodsForEviction` |
 | `internal/nodeagent/handler_test.go` | Unit tests for selection + fake-client integration tests |
 | `cmd/node-agent/main.go` | Entrypoint |
 | `config/node-agent/daemonset.yaml` | DaemonSet manifest |
@@ -29,6 +29,8 @@
 **Files:**
 - Create: `internal/nodeagent/imds.go`
 - Create: `internal/nodeagent/imds_test.go`
+
+**Implementation note:** Uses the AWS SDK IMDS client (`github.com/aws/aws-sdk-go-v2/feature/ec2/imds`) rather than raw `net/http`. This handles IMDSv2 token acquisition automatically — new AWS instances disable IMDSv1 by default, making the SDK approach necessary for correctness. Tests use an injectable `fakeIMDSClient` interface rather than `httptest.Server`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -43,37 +45,46 @@ package nodeagent_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 
 	"github.com/louisolivier/kost/internal/nodeagent"
 )
 
-func TestIMDSPoller_DetectsInterruption(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+type fakeIMDSClient struct {
+	err error
+}
 
-	poller := nodeagent.NewIMDSPollerWithURL(server.URL, 10*time.Millisecond, slog.Default())
+func (f *fakeIMDSClient) GetMetadata(_ context.Context, _ *imds.GetMetadataInput, _ ...func(*imds.Options)) (*imds.GetMetadataOutput, error) {
+	return nil, f.err
+}
+
+type httpError struct {
+	statusCode int
+	msg        string
+}
+
+func (e *httpError) Error() string       { return e.msg }
+func (e *httpError) HTTPStatusCode() int { return e.statusCode }
+
+func TestIMDSPoller_DetectsInterruption(t *testing.T) {
+	// nil error = GetMetadata succeeded = termination-time exists = interruption
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: nil}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	if !poller.Run(ctx) {
-		t.Fatal("expected interruption to be detected on 200 response")
+		t.Fatal("expected interruption to be detected when GetMetadata returns nil error")
 	}
 }
 
 func TestIMDSPoller_NoInterruption_OnNotFound(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	poller := nodeagent.NewIMDSPollerWithURL(server.URL, 10*time.Millisecond, slog.Default())
+	notFound := &httpError{statusCode: 404, msg: "404 Not Found"}
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: notFound}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -83,8 +94,8 @@ func TestIMDSPoller_NoInterruption_OnNotFound(t *testing.T) {
 }
 
 func TestIMDSPoller_ConnectionError_DoesNotTrigger(t *testing.T) {
-	// Port 1 will refuse connections
-	poller := nodeagent.NewIMDSPollerWithURL("http://127.0.0.1:1", 10*time.Millisecond, slog.Default())
+	networkErr := fmt.Errorf("connection refused")
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: networkErr}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -94,12 +105,8 @@ func TestIMDSPoller_ConnectionError_DoesNotTrigger(t *testing.T) {
 }
 
 func TestIMDSPoller_UnexpectedStatus_DoesNotTrigger(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	poller := nodeagent.NewIMDSPollerWithURL(server.URL, 10*time.Millisecond, slog.Default())
+	serverErr := &httpError{statusCode: 500, msg: "500 Internal Server Error"}
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: serverErr}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -126,36 +133,44 @@ package nodeagent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
-	"net/http"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 )
 
-const imdsTerminationURL = "http://169.254.169.254/latest/meta-data/spot/termination-time"
+// IMDSClient is an interface over the AWS IMDS client for testability.
+type IMDSClient interface {
+	GetMetadata(ctx context.Context, params *imds.GetMetadataInput, optFns ...func(*imds.Options)) (*imds.GetMetadataOutput, error)
+}
 
 type IMDSPoller struct {
-	url      string
-	client   *http.Client
+	client   IMDSClient
 	interval time.Duration
 	logger   *slog.Logger
 }
 
+// NewIMDSPoller creates a poller using the real AWS IMDS client (handles IMDSv1 and IMDSv2).
 func NewIMDSPoller(interval time.Duration, logger *slog.Logger) *IMDSPoller {
-	return NewIMDSPollerWithURL(imdsTerminationURL, interval, logger)
-}
-
-func NewIMDSPollerWithURL(url string, interval time.Duration, logger *slog.Logger) *IMDSPoller {
 	return &IMDSPoller{
-		url:      url,
-		client:   &http.Client{Timeout: time.Second},
+		client:   imds.New(imds.Options{}),
 		interval: interval,
 		logger:   logger,
 	}
 }
 
+// NewIMDSPollerWithClient creates a poller with an injectable IMDS client for testing.
+func NewIMDSPollerWithClient(client IMDSClient, interval time.Duration, logger *slog.Logger) *IMDSPoller {
+	return &IMDSPoller{client: client, interval: interval, logger: logger}
+}
+
 // Run polls IMDS until an interruption notice is detected or ctx is cancelled.
-// Returns true if an interruption notice was received (HTTP 200).
+// Returns true if an interruption notice was received. Polls once immediately on start.
 func (p *IMDSPoller) Run(ctx context.Context) bool {
+	if p.poll(ctx) {
+		return true
+	}
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for {
@@ -171,28 +186,26 @@ func (p *IMDSPoller) Run(ctx context.Context) bool {
 }
 
 func (p *IMDSPoller) poll(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
-	if err != nil {
-		p.logger.Warn("imds: failed to build request", "error", err)
-		return false
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.logger.Warn("imds: poll failed", "error", err)
-		return false
-	}
-	defer resp.Body.Close()
+	// Bound each individual poll to 1 second regardless of SDK defaults
+	pollCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
+	_, err := p.client.GetMetadata(pollCtx, &imds.GetMetadataInput{
+		Path: "spot/termination-time",
+	})
+	if err == nil {
+		// Successful response means termination-time field exists — interruption notice received
 		p.logger.Info("imds: spot interruption notice received")
 		return true
-	case http.StatusNotFound:
-		return false
-	default:
-		p.logger.Warn("imds: unexpected status", "status", resp.StatusCode)
-		return false
 	}
+
+	var notFoundErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &notFoundErr) && notFoundErr.HTTPStatusCode() == 404 {
+		return false // no notice yet
+	}
+
+	p.logger.Warn("imds: poll failed", "error", err)
+	return false
 }
 ```
 
