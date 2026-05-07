@@ -163,7 +163,7 @@ func TestInterruptionHandler_EvictsKostPods(t *testing.T) {
 }
 
 func TestInterruptionHandler_MissingNode_StillEvicts(t *testing.T) {
-	// Cordon fails (node not found) but handler should still attempt pod eviction
+	// Cordon will fail (no node in client), but handler should still evict kost pods
 	scaler := &kostv1alpha1.CostAwareScaler{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-scaler", Namespace: "default"},
 		Spec: kostv1alpha1.CostAwareScalerSpec{
@@ -173,13 +173,26 @@ func TestInterruptionHandler_MissingNode_StillEvicts(t *testing.T) {
 			Cost:      kostv1alpha1.CostSpec{InstanceType: "m5.xlarge", AvailabilityZone: "us-east-1a", HourlyBudgetUSD: 10},
 		},
 	}
+	workerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "worker-1", Namespace: "default",
+			Labels: map[string]string{"app": "my-worker"},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(buildScheme()).
-		WithObjects(scaler). // no node
+		WithObjects(scaler, workerPod). // no node — cordon will fail
 		Build()
 
 	handler := nodeagent.NewInterruptionHandler("node-a", fakeClient, slog.Default())
-	// Should not panic even when node is missing
-	handler.Handle(context.Background())
+	handler.Handle(context.Background()) // must not panic
+
+	// Pod should be evicted (deleted) even though cordon failed
+	var remaining corev1.Pod
+	err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "worker-1", Namespace: "default"}, &remaining)
+	if err == nil {
+		t.Error("expected worker-1 to be evicted, but it still exists")
+	}
 }
