@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -43,9 +45,15 @@ func main() {
 	handler := nodeagent.NewInterruptionHandler(nodeName, k8sClient, logger)
 	poller := nodeagent.NewIMDSPoller(5*time.Second, logger)
 
+	// Signal-aware context for the polling loop — allows clean shutdown via SIGTERM/SIGINT
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	logger.Info("kost node agent started", "node", nodeName)
 
-	if poller.Run(context.Background()) {
+	if poller.Run(ctx) {
+		// Use a fresh background context for the handler — the node is going away,
+		// we must not abort eviction due to the signal context being cancelled.
 		handler.Handle(context.Background())
 	}
 }
