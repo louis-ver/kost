@@ -2,37 +2,49 @@ package nodeagent_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 
 	"github.com/louisolivier/kost/internal/nodeagent"
 )
 
-func TestIMDSPoller_DetectsInterruption(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+// fakeIMDSClient implements IMDSClient for testing.
+type fakeIMDSClient struct {
+	err error
+}
 
-	poller := nodeagent.NewIMDSPollerWithURL(server.URL, 10*time.Millisecond, slog.Default())
+func (f *fakeIMDSClient) GetMetadata(_ context.Context, _ *imds.GetMetadataInput, _ ...func(*imds.Options)) (*imds.GetMetadataOutput, error) {
+	return nil, f.err
+}
+
+// httpError simulates an AWS SDK error with an HTTP status code.
+type httpError struct {
+	statusCode int
+	msg        string
+}
+
+func (e *httpError) Error() string       { return e.msg }
+func (e *httpError) HTTPStatusCode() int { return e.statusCode }
+
+func TestIMDSPoller_DetectsInterruption(t *testing.T) {
+	// nil error means GetMetadata succeeded = termination-time exists = interruption
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: nil}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	if !poller.Run(ctx) {
-		t.Fatal("expected interruption to be detected on 200 response")
+		t.Fatal("expected interruption to be detected when GetMetadata returns nil error")
 	}
 }
 
 func TestIMDSPoller_NoInterruption_OnNotFound(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	poller := nodeagent.NewIMDSPollerWithURL(server.URL, 10*time.Millisecond, slog.Default())
+	// 404 error = path not found = no interruption notice yet
+	notFound := &httpError{statusCode: 404, msg: "404 Not Found"}
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: notFound}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -42,7 +54,8 @@ func TestIMDSPoller_NoInterruption_OnNotFound(t *testing.T) {
 }
 
 func TestIMDSPoller_ConnectionError_DoesNotTrigger(t *testing.T) {
-	poller := nodeagent.NewIMDSPollerWithURL("http://127.0.0.1:1", 10*time.Millisecond, slog.Default())
+	networkErr := fmt.Errorf("connection refused")
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: networkErr}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -52,12 +65,8 @@ func TestIMDSPoller_ConnectionError_DoesNotTrigger(t *testing.T) {
 }
 
 func TestIMDSPoller_UnexpectedStatus_DoesNotTrigger(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	poller := nodeagent.NewIMDSPollerWithURL(server.URL, 10*time.Millisecond, slog.Default())
+	serverErr := &httpError{statusCode: 500, msg: "500 Internal Server Error"}
+	poller := nodeagent.NewIMDSPollerWithClient(&fakeIMDSClient{err: serverErr}, 10*time.Millisecond, slog.Default())
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 

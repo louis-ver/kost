@@ -2,35 +2,40 @@ package nodeagent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
-	"net/http"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 )
 
-const imdsTerminationURL = "http://169.254.169.254/latest/meta-data/spot/termination-time"
+// IMDSClient is an interface over the AWS IMDS client for testability.
+type IMDSClient interface {
+	GetMetadata(ctx context.Context, params *imds.GetMetadataInput, optFns ...func(*imds.Options)) (*imds.GetMetadataOutput, error)
+}
 
 type IMDSPoller struct {
-	url      string
-	client   *http.Client
+	client   IMDSClient
 	interval time.Duration
 	logger   *slog.Logger
 }
 
+// NewIMDSPoller creates a poller using the real AWS IMDS client (handles IMDSv1 and IMDSv2).
 func NewIMDSPoller(interval time.Duration, logger *slog.Logger) *IMDSPoller {
-	return NewIMDSPollerWithURL(imdsTerminationURL, interval, logger)
-}
-
-func NewIMDSPollerWithURL(url string, interval time.Duration, logger *slog.Logger) *IMDSPoller {
 	return &IMDSPoller{
-		url:      url,
-		client:   &http.Client{Timeout: time.Second},
+		client:   imds.New(imds.Options{}),
 		interval: interval,
 		logger:   logger,
 	}
 }
 
+// NewIMDSPollerWithClient creates a poller with an injectable IMDS client for testing.
+func NewIMDSPollerWithClient(client IMDSClient, interval time.Duration, logger *slog.Logger) *IMDSPoller {
+	return &IMDSPoller{client: client, interval: interval, logger: logger}
+}
+
 // Run polls IMDS until an interruption notice is detected or ctx is cancelled.
-// Returns true if an interruption notice was received (HTTP 200).
+// Returns true if an interruption notice was received.
 func (p *IMDSPoller) Run(ctx context.Context) bool {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -47,26 +52,22 @@ func (p *IMDSPoller) Run(ctx context.Context) bool {
 }
 
 func (p *IMDSPoller) poll(ctx context.Context) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
-	if err != nil {
-		p.logger.Warn("imds: failed to build request", "error", err)
-		return false
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.logger.Warn("imds: poll failed", "error", err)
-		return false
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK:
+	_, err := p.client.GetMetadata(ctx, &imds.GetMetadataInput{
+		Path: "spot/termination-time",
+	})
+	if err == nil {
+		// Successful response means the termination-time field exists — interruption notice received
 		p.logger.Info("imds: spot interruption notice received")
 		return true
-	case http.StatusNotFound:
-		return false
-	default:
-		p.logger.Warn("imds: unexpected status", "status", resp.StatusCode)
-		return false
 	}
+
+	// Check if the error is a 404-equivalent (path not found = no interruption notice)
+	var notFoundErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &notFoundErr) && notFoundErr.HTTPStatusCode() == 404 {
+		return false // no notice yet
+	}
+
+	// Any other error (network, IMDSv2 token failure, etc.) — log and keep polling
+	p.logger.Warn("imds: poll failed", "error", err)
+	return false
 }
