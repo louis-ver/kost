@@ -117,6 +117,8 @@ func TestInterruptionHandler_CordonsNode(t *testing.T) {
 }
 
 func TestInterruptionHandler_EvictsKostPods(t *testing.T) {
+	ctx := context.Background()
+
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
 	}
@@ -150,15 +152,27 @@ func TestInterruptionHandler_EvictsKostPods(t *testing.T) {
 		Build()
 
 	handler := nodeagent.NewInterruptionHandler("node-a", fakeClient, slog.Default())
-	handler.Handle(context.Background())
+	handler.Handle(ctx)
 
 	// Node must be cordoned
 	var updated corev1.Node
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "node-a"}, &updated); err != nil {
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "node-a"}, &updated); err != nil {
 		t.Fatalf("failed to get node: %v", err)
 	}
 	if !updated.Spec.Unschedulable {
 		t.Error("expected node to be cordoned")
+	}
+
+	// worker-1 (kost-managed) should be evicted
+	var evicted corev1.Pod
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "worker-1", Namespace: "default"}, &evicted); err == nil {
+		t.Error("expected worker-1 to be evicted, but it still exists")
+	}
+
+	// other-1 (not kost-managed) should survive
+	var surviving corev1.Pod
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "other-1", Namespace: "default"}, &surviving); err != nil {
+		t.Errorf("expected other-1 to survive eviction, got: %v", err)
 	}
 }
 
