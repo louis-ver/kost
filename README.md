@@ -148,9 +148,30 @@ kost_pricing_poll_errors_total{scaler}
 - Deployments only
 - Single `CostAwareScaler` per operator deployment
 
+## Spot interruption handling (v0.2)
+
+`kost-node-agent` is a DaemonSet that detects EC2 spot interruption notices and gracefully evicts kost worker pods within the 2-minute window — before Kubernetes would normally react (5+ minute lag).
+
+**What it does:**
+1. Polls the EC2 Instance Metadata Service every 5s for a termination notice (supports IMDSv1 and IMDSv2)
+2. On notice: cordons the node (prevents new pods scheduling there)
+3. Discovers kost-managed worker pods on the node via `CostAwareScaler` objects
+4. Evicts them via the Kubernetes Eviction API (respects PodDisruptionBudgets)
+
+**What it does NOT do:** immediately reset SQS message visibility. Workers that handle `SIGTERM` can call `ChangeMessageVisibility(0)` to immediately re-queue their in-flight messages. Without this, messages become visible again after the SQS visibility timeout expires naturally.
+
+**Deploy:**
+
+```bash
+kubectl create namespace kost-system
+kubectl apply -f config/node-agent/rbac.yaml
+kubectl apply -f config/node-agent/daemonset.yaml
+```
+
+**Pod matching:** the node agent matches pods using the `app=<deployment-name>` label, which `kubectl create deployment` sets by default. If your Deployment uses a custom label selector, ensure the `app` label is set to the Deployment name.
+
 ## Roadmap
 
-- **v0.2 — Spot interruption handling**: detect EC2 spot interruption notices, requeue in-flight SQS messages before the instance is reclaimed
 - **v0.3 — GPU instance support**: extend cost lookup to GPU instance types for batch inference workloads
 - **Multi-queue / multi-CRD**: per-scaler poller lifecycle
 
