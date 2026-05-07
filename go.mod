@@ -3,8 +3,15 @@ module github.com/louisolivier/kost
 go 1.25.7
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.41.7
+	github.com/aws/aws-sdk-go-v2/config v1.32.17
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.23
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.300.0
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.27
 	github.com/onsi/ginkgo/v2 v2.27.2
 	github.com/onsi/gomega v1.38.2
+	github.com/prometheus/client_golang v1.23.2
+	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0
 	sigs.k8s.io/controller-runtime v0.23.3
@@ -14,18 +21,13 @@ require (
 	cel.dev/expr v0.24.0 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.41.7 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.32.17 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.24 // indirect
-	github.com/aws/aws-sdk-go-v2/service/ec2 v1.300.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.23 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.11 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.27 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.17 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.21 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1 // indirect
@@ -62,7 +64,6 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
@@ -101,7 +102,6 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/api v0.35.0 // indirect
 	k8s.io/apiextensions-apiserver v0.35.0 // indirect
 	k8s.io/apiserver v0.35.0 // indirect
 	k8s.io/component-base v0.35.0 // indirect
