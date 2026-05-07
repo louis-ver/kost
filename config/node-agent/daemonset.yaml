@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kost-node-agent
+  namespace: kost-system
+spec:
+  selector:
+    matchLabels:
+      app: kost-node-agent
+  template:
+    metadata:
+      labels:
+        app: kost-node-agent
+    spec:
+      serviceAccountName: kost-node-agent
+      containers:
+        - name: node-agent
+          image: ghcr.io/louis-ver/kost-node-agent:latest
+          imagePullPolicy: Always
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      tolerations:
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 10
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 10
